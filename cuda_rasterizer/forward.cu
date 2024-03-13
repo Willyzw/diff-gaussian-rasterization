@@ -11,6 +11,8 @@
 
 #include "forward.h"
 #include "auxiliary.h"
+#include "helper_math.h"
+#include "math.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -266,17 +268,20 @@ renderCUDA(
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
-	const float* __restrict__ depths,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
-	float* __restrict__ out_depth)
+	const float* __restrict__ depth,
+	float* __restrict__ out_depth, 
+	float* __restrict__ out_opacity,
+	int * __restrict__ n_touched)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
-	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+    uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	// uint32_t horizontal_blocks = gridDim.x; # TODO Maybe it's different?
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
@@ -297,13 +302,14 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_depth[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
-	float D = { 0 };
+	float D = 0.0f;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -321,6 +327,7 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_depth[block.thread_rank()] = depth[coll_id];
 		}
 		block.sync();
 
@@ -344,20 +351,24 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
+			if (alpha < 1.0f / 255.0f) {
 				continue;
+			}
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
 				done = true;
 				continue;
 			}
-
 			// Eq. (3) from 3D Gaussian splatting paper.
-			for (int ch = 0; ch < CHANNELS; ch++)
+			for (int ch = 0; ch < CHANNELS; ch++) {
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
-			D += depths[collected_id[j]] * alpha * T;
-
+			}
+			D += collected_depth[j] * alpha * T;
+			// Keep track of how many pixels touched this Gaussian.
+			if (test_T > 0.5f) {
+				atomicAdd(&(n_touched[collected_id[j]]), 1);
+			}
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -372,9 +383,11 @@ renderCUDA(
 	{
 		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
-		for (int ch = 0; ch < CHANNELS; ch++)
+		for (int ch = 0; ch < CHANNELS; ch++) {
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		}
 		out_depth[pix_id] = D;
+		out_opacity[pix_id] = 1 - T;
 	}
 }
 
@@ -385,13 +398,15 @@ void FORWARD::render(
 	int W, int H,
 	const float2* means2D,
 	const float* colors,
-	const float* depths,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
-	float* out_depth)
+	const float* depth,
+	float* out_depth, 
+	float* out_opacity,
+	int* n_touched)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -399,13 +414,15 @@ void FORWARD::render(
 		W, H,
 		means2D,
 		colors,
-		depths,
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
 		out_color,
-		out_depth);
+		depth,
+		out_depth,
+		out_opacity,
+		n_touched);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
